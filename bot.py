@@ -4,6 +4,7 @@ Telegram Bot: Polymarket & predict.fun 交易量變化播報器
 指令：
   /start  — 啟動 Bot，記錄你的 Chat ID
   /report — 立即取得最新報告
+  /stop   — 取消訂閱自動播報
 """
 
 import os
@@ -14,10 +15,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import httpx
-from telegram import Update, Bot
+from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 from telegram.constants import ParseMode
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 # ─── 設定 ───────────────────────────────────────────────
 logging.basicConfig(
@@ -26,7 +26,6 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# 環境變數
 TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
 PREDICT_FUN_API_KEY = os.environ.get("PREDICT_FUN_API_KEY", "")
 
@@ -34,18 +33,14 @@ if not TG_BOT_TOKEN:
     logger.error("❌ 未設定 TG_BOT_TOKEN 環境變數！")
     exit(1)
 
-# API 端點
 POLYMARKET_GAMMA_BASE = "https://gamma-api.polymarket.com"
 PREDICT_FUN_BASE = "https://api.predict.fun"
 
-# 快照檔案路徑
 SNAPSHOT_DIR = Path(os.environ.get("SNAPSHOT_DIR", "/tmp/pm-snapshots"))
 SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
 
 POLY_SNAPSHOT = SNAPSHOT_DIR / "polymarket_snapshot.json"
 PREDICT_SNAPSHOT = SNAPSHOT_DIR / "predict_snapshot.json"
-
-# 訂閱者檔案（記錄誰按了 /start）
 SUBSCRIBERS_FILE = SNAPSHOT_DIR / "subscribers.json"
 
 
@@ -209,13 +204,11 @@ def compute_volume_changes(current: list[dict], previous_snapshot: dict | None) 
         return sorted(current, key=lambda x: x["volume_delta"], reverse=True)
 
     prev_markets = previous_snapshot.get("markets", {})
-
     results = []
     for m in current:
         prev = prev_markets.get(m["id"])
         prev_vol = prev["volume"] if prev else 0
         delta = m["volume"] - prev_vol
-
         results.append({
             **m,
             "volume_delta": delta,
@@ -224,11 +217,10 @@ def compute_volume_changes(current: list[dict], previous_snapshot: dict | None) 
                 round((delta / prev_vol) * 100, 2) if prev_vol > 0 else None
             ),
         })
-
     return sorted(results, key=lambda x: x["volume_delta"], reverse=True)
 
 
-# ─── 格式化訊息 ──────────────────────────────────────────
+# ─── 格式化 ─────────────────────────────────────────────
 def format_volume_number(n: float) -> str:
     if abs(n) >= 1_000_000:
         return f"${n / 1_000_000:,.2f}M"
@@ -240,14 +232,12 @@ def format_volume_number(n: float) -> str:
 
 def build_report(poly_changes: list[dict], predict_changes: list[dict], timestamp: str) -> str:
     lines = [
-        f"<b>📊 預測市場交易量變化報告</b>",
+        "<b>📊 預測市場交易量變化報告</b>",
         f"<i>⏰ {timestamp} UTC</i>",
         "",
+        "<b>🟣 Polymarket — 交易量變化 Top 10</b>",
+        "",
     ]
-
-    # ── Polymarket Top 10 ──
-    lines.append("<b>🟣 Polymarket — 交易量變化 Top 10</b>")
-    lines.append("")
 
     if not poly_changes:
         lines.append("<i>暫無資料（首次執行或 API 異常）</i>")
@@ -257,11 +247,7 @@ def build_report(poly_changes: list[dict], predict_changes: list[dict], timestam
             vol_str = format_volume_number(m["volume"])
             pct = f" ({m['pct_change']:+.1f}%)" if m["pct_change"] is not None else ""
             arrow = "🔺" if m["volume_delta"] > 0 else "🔻" if m["volume_delta"] < 0 else "➖"
-
-            question = m["question"][:60]
-            if len(m["question"]) > 60:
-                question += "…"
-
+            question = m["question"][:60] + ("…" if len(m["question"]) > 60 else "")
             lines.append(
                 f"{i}. {arrow} <b>{question}</b>\n"
                 f"   變化: <code>{delta_str}</code>{pct} │ "
@@ -270,7 +256,6 @@ def build_report(poly_changes: list[dict], predict_changes: list[dict], timestam
             )
             lines.append("")
 
-    # ── predict.fun Top 10 ──
     lines.append("<b>🟢 predict.fun — 交易量變化 Top 10</b>")
     lines.append("")
 
@@ -285,11 +270,7 @@ def build_report(poly_changes: list[dict], predict_changes: list[dict], timestam
             vol_str = format_volume_number(m["volume"])
             pct = f" ({m['pct_change']:+.1f}%)" if m["pct_change"] is not None else ""
             arrow = "🔺" if m["volume_delta"] > 0 else "🔻" if m["volume_delta"] < 0 else "➖"
-
-            question = m["question"][:60]
-            if len(m["question"]) > 60:
-                question += "…"
-
+            question = m["question"][:60] + ("…" if len(m["question"]) > 60 else "")
             lines.append(
                 f"{i}. {arrow} <b>{question}</b>\n"
                 f"   變化: <code>{delta_str}</code>{pct} │ "
@@ -302,10 +283,9 @@ def build_report(poly_changes: list[dict], predict_changes: list[dict], timestam
     return "\n".join(lines)
 
 
-# ─── 產生報告（共用邏輯）─────────────────────────────────
+# ─── 產生報告（共用）─────────────────────────────────────
 async def generate_report() -> str:
     logger.info("開始抓取市場資料...")
-
     async with httpx.AsyncClient() as client:
         poly_markets, predict_markets = await asyncio.gather(
             fetch_polymarket_markets(client),
@@ -314,10 +294,8 @@ async def generate_report() -> str:
 
     poly_prev = load_snapshot(POLY_SNAPSHOT)
     predict_prev = load_snapshot(PREDICT_SNAPSHOT)
-
     poly_changes = compute_volume_changes(poly_markets, poly_prev)
     predict_changes = compute_volume_changes(predict_markets, predict_prev)
-
     save_snapshot(poly_markets, POLY_SNAPSHOT)
     save_snapshot(predict_markets, PREDICT_SNAPSHOT)
 
@@ -325,9 +303,8 @@ async def generate_report() -> str:
     return build_report(poly_changes, predict_changes, now_str)
 
 
-# ─── Telegram 指令處理 ───────────────────────────────────
+# ─── Telegram 指令 ───────────────────────────────────────
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """處理 /start 指令"""
     chat_id = update.effective_chat.id
     subscribers.add(chat_id)
     save_subscribers(subscribers)
@@ -335,7 +312,7 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await update.message.reply_text(
         "<b>👋 歡迎使用預測市場播報 Bot！</b>\n\n"
-        "📡 我會每小時自動發送 Polymarket & predict.fun 交易量變化 Top 10\n\n"
+        "📡 每小時自動發送 Polymarket & predict.fun 交易量變化 Top 10\n\n"
         "<b>可用指令：</b>\n"
         "/report — 立即取得最新報告\n"
         "/stop — 取消訂閱自動播報\n\n"
@@ -343,13 +320,10 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         parse_mode=ParseMode.HTML,
     )
 
-    # 立即發送一份報告
     try:
         message = await generate_report()
         await update.message.reply_text(
-            message,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+            message, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
         )
     except Exception as e:
         logger.error(f"產生報告失敗: {e}")
@@ -357,15 +331,11 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """處理 /report 指令 — 手動取得最新報告"""
     await update.message.reply_text("⏳ 正在抓取最新資料，請稍候...")
-
     try:
         message = await generate_report()
         await update.message.reply_text(
-            message,
-            parse_mode=ParseMode.HTML,
-            disable_web_page_preview=True,
+            message, parse_mode=ParseMode.HTML, disable_web_page_preview=True,
         )
     except Exception as e:
         logger.error(f"產生報告失敗: {e}")
@@ -373,16 +343,17 @@ async def cmd_report(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def cmd_stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """處理 /stop 指令 — 取消訂閱"""
     chat_id = update.effective_chat.id
     subscribers.discard(chat_id)
     save_subscribers(subscribers)
-    await update.message.reply_text("✅ 已取消訂閱，不會再收到自動播報。\n隨時可以用 /start 重新訂閱。")
+    await update.message.reply_text(
+        "✅ 已取消訂閱，不會再收到自動播報。\n隨時可以用 /start 重新訂閱。"
+    )
 
 
-# ─── 排程自動播報 ────────────────────────────────────────
-async def scheduled_broadcast(app: Application):
-    """每小時自動發送報告給所有訂閱者"""
+# ─── 排程：用 python-telegram-bot 內建 JobQueue ─────────
+async def scheduled_broadcast(context: ContextTypes.DEFAULT_TYPE):
+    """每小時自動播報給所有訂閱者"""
     if not subscribers:
         logger.info("目前沒有訂閱者，跳過播報")
         return
@@ -393,10 +364,9 @@ async def scheduled_broadcast(app: Application):
         logger.error(f"排程報告產生失敗: {e}")
         return
 
-    bot = app.bot
     for chat_id in list(subscribers):
         try:
-            await bot.send_message(
+            await context.bot.send_message(
                 chat_id=chat_id,
                 text=message,
                 parse_mode=ParseMode.HTML,
@@ -405,7 +375,6 @@ async def scheduled_broadcast(app: Application):
             logger.info(f"✅ 已發送給 {chat_id}")
         except Exception as e:
             logger.error(f"發送給 {chat_id} 失敗: {e}")
-            # 如果是被封鎖了就移除
             if "Forbidden" in str(e):
                 subscribers.discard(chat_id)
                 save_subscribers(subscribers)
@@ -415,7 +384,6 @@ async def scheduled_broadcast(app: Application):
 def main():
     logger.info("🚀 Bot 啟動中...")
 
-    # 建立 Telegram Bot Application
     app = Application.builder().token(TG_BOT_TOKEN).build()
 
     # 註冊指令
@@ -423,18 +391,13 @@ def main():
     app.add_handler(CommandHandler("report", cmd_report))
     app.add_handler(CommandHandler("stop", cmd_stop))
 
-    # 設定排程：每小時整點自動播報
-    scheduler = AsyncIOScheduler(timezone="UTC")
-    scheduler.add_job(
+    # 用內建 JobQueue 排程，每 3600 秒（1 小時）執行一次
+    app.job_queue.run_repeating(
         scheduled_broadcast,
-        "cron",
-        minute=0,
-        args=[app],
+        interval=3600,
+        first=3600,  # 第一次在 1 小時後執行（用戶按 /start 時會立即收到）
     )
-    scheduler.start()
-    logger.info("⏰ 排程已設定：每小時整點執行")
 
-    # 啟動 Bot（polling 模式，會持續監聽訊息）
     logger.info("✅ Bot 已啟動，等待指令中...")
     app.run_polling(drop_pending_updates=True)
 
