@@ -62,7 +62,92 @@ subscribers: set = load_subscribers()
 
 
 # ─── Polymarket 資料抓取 ──────────────────────────────────
+def _build_polymarket_url(m: dict) -> str:
+    """根據 API 回傳的欄位建構正確的 Polymarket 網址"""
+    # 優先用 event slug（事件頁面）
+    event_slug = m.get("event_slug") or m.get("eventSlug") or ""
+    if event_slug:
+        return f"https://polymarket.com/event/{event_slug}"
+    # 其次用 market slug
+    slug = m.get("slug") or m.get("market_slug") or ""
+    if slug:
+        return f"https://polymarket.com/event/{slug}"
+    # 最後用 condition_id
+    cid = m.get("condition_id") or m.get("conditionId") or m.get("id") or ""
+    return f"https://polymarket.com/market/{cid}"
+
+
 async def fetch_polymarket_markets(client: httpx.AsyncClient) -> list[dict]:
+    """
+    先嘗試 /events 端點（URL 最準確），若失敗再降級到 /markets。
+    """
+    markets = await _fetch_polymarket_events(client)
+    if not markets:
+        logger.info("events 端點無資料，改用 /markets")
+        markets = await _fetch_polymarket_markets_fallback(client)
+    return markets
+
+
+async def _fetch_polymarket_events(client: httpx.AsyncClient) -> list[dict]:
+    """透過 /events 端點抓取，URL 格式保證正確"""
+    markets = []
+    offset = 0
+    limit = 100
+
+    while True:
+        try:
+            resp = await client.get(
+                f"{POLYMARKET_GAMMA_BASE}/events",
+                params={
+                    "closed": "false",
+                    "archived": "false",
+                    "limit": limit,
+                    "offset": offset,
+                    "order": "volume",
+                    "ascending": "false",
+                },
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json()
+        except Exception as e:
+            logger.error(f"Polymarket Events API 錯誤 (offset={offset}): {e}")
+            break
+
+        if not data:
+            break
+
+        for ev in data:
+            # events 端點：每個 event 可能包含多個 markets
+            slug = ev.get("slug", "")
+            url = f"https://polymarket.com/event/{slug}" if slug else ""
+
+            # 取 event 層級的總交易量
+            volume_raw = ev.get("volume") or ev.get("volumeNum") or 0
+            try:
+                volume = float(volume_raw)
+            except (ValueError, TypeError):
+                volume = 0.0
+
+            title = ev.get("title") or ev.get("question") or "Unknown"
+
+            markets.append({
+                "id": str(ev.get("id", "")),
+                "question": title,
+                "volume": volume,
+                "url": url,
+            })
+
+        offset += limit
+        if offset >= 2000 or len(data) < limit:
+            break
+
+    logger.info(f"Polymarket (events): 取得 {len(markets)} 個事件")
+    return markets
+
+
+async def _fetch_polymarket_markets_fallback(client: httpx.AsyncClient) -> list[dict]:
+    """降級方案：用 /markets 端點"""
     markets = []
     offset = 0
     limit = 100
@@ -84,7 +169,7 @@ async def fetch_polymarket_markets(client: httpx.AsyncClient) -> list[dict]:
             resp.raise_for_status()
             data = resp.json()
         except Exception as e:
-            logger.error(f"Polymarket API 錯誤 (offset={offset}): {e}")
+            logger.error(f"Polymarket Markets API 錯誤 (offset={offset}): {e}")
             break
 
         if not data:
@@ -101,14 +186,14 @@ async def fetch_polymarket_markets(client: httpx.AsyncClient) -> list[dict]:
                 "id": str(m.get("id", m.get("condition_id", ""))),
                 "question": m.get("question", "Unknown"),
                 "volume": volume,
-                "url": f"https://polymarket.com/event/{m.get('slug', '')}",
+                "url": _build_polymarket_url(m),
             })
 
         offset += limit
         if offset >= 2000 or len(data) < limit:
             break
 
-    logger.info(f"Polymarket: 取得 {len(markets)} 個市場")
+    logger.info(f"Polymarket (markets fallback): 取得 {len(markets)} 個市場")
     return markets
 
 
