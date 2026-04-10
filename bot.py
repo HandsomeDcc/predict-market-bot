@@ -278,157 +278,111 @@ async def _fetch_polymarket_markets_fallback(client: httpx.AsyncClient) -> list[
 # ═══════════════════════════════════════════════════════════
 # predict.fun 資料抓取
 # ═══════════════════════════════════════════════════════════
-
-# predict.fun 可能的 API 路徑（按優先順序嘗試）
-PREDICT_FUN_ENDPOINTS = [
-    "/v1/markets",
-    "/api/v1/markets",
-    "/api/markets",
-    "/markets",
-]
-
+# API 文檔: https://dev.predict.fun/
+# 端點: GET https://api.predict.fun/v1/markets
+# 認證: x-api-key header
+# 分頁: first (數量) + after (cursor)
+# 回應: { success: bool, cursor: string, data: [...] }
+# 市場欄位: id, title, question, status, categorySlug, outcomes, ...
 
 async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
     if not PREDICT_FUN_API_KEY:
         logger.warning("未設定 PREDICT_FUN_API_KEY，跳過 predict.fun")
         return []
 
-    # 嘗試多個端點
-    for endpoint in PREDICT_FUN_ENDPOINTS:
-        markets = await _try_predict_fun_endpoint(client, endpoint)
-        if markets is not None:  # None = 失敗, [] = 成功但沒資料
-            return markets
-
-    logger.error("predict.fun: 所有端點均失敗")
-    return []
-
-
-async def _try_predict_fun_endpoint(
-    client: httpx.AsyncClient, endpoint: str
-) -> list[dict] | None:
-    """嘗試單一 predict.fun 端點，成功回傳 list，失敗回傳 None"""
     markets = []
-    cursor = None
-    base_url = f"{PREDICT_FUN_BASE}{endpoint}"
-
-    # 嘗試不同的 header 名稱
-    headers_options = [
-        {"x-api-key": PREDICT_FUN_API_KEY},
-        {"X-API-KEY": PREDICT_FUN_API_KEY},
-        {"Authorization": f"Bearer {PREDICT_FUN_API_KEY}"},
-        {"api-key": PREDICT_FUN_API_KEY},
-    ]
-
-    # 先試第一頁找到能用的 header
-    working_headers = None
-    first_data = None
-
-    for headers in headers_options:
-        try:
-            resp = await client.get(
-                base_url,
-                params={"limit": 5},
-                headers=headers,
-                timeout=15,
-            )
-            if resp.status_code == 200:
-                first_data = resp.json()
-                working_headers = headers
-                logger.info(
-                    f"predict.fun: 端點 {endpoint} 可用 "
-                    f"(header: {list(headers.keys())[0]}, "
-                    f"回應類型: {type(first_data).__name__})"
-                )
-                # 印出回應結構以便除錯
-                if isinstance(first_data, dict):
-                    logger.info(f"predict.fun 回應 keys: {list(first_data.keys())}")
-                elif isinstance(first_data, list) and first_data:
-                    logger.info(f"predict.fun 第一筆 keys: {list(first_data[0].keys()) if isinstance(first_data[0], dict) else 'not dict'}")
-                break
-            else:
-                logger.debug(
-                    f"predict.fun: {endpoint} + {list(headers.keys())[0]} "
-                    f"回傳 {resp.status_code}"
-                )
-        except Exception as e:
-            logger.debug(f"predict.fun: {endpoint} 連線失敗: {e}")
-            continue
-
-    if not working_headers:
-        return None  # 這個端點不行，試下一個
-
-    # 正式抓取資料
+    after_cursor = None
     page = 0
+    base_url = f"{PREDICT_FUN_BASE}/v1/markets"
+    headers = {"x-api-key": PREDICT_FUN_API_KEY}
+
     while True:
         try:
-            params: dict = {"limit": 100}
-            # 嘗試不同的狀態參數名稱
-            for status_key in ["status", "state", "filter"]:
-                for status_val in ["ACTIVE", "active", "open", "OPEN"]:
-                    params[status_key] = status_val
-                    break
-                break
-            # 簡化：只用最常見的
-            params = {"limit": 100, "status": "ACTIVE"}
-            if cursor:
-                params["cursor"] = cursor
-            if page > 0 and not cursor:
-                params["offset"] = page * 100
+            # predict.fun 用 first/after 分頁
+            params: dict = {"first": 100}
+            if after_cursor:
+                params["after"] = after_cursor
 
             resp = await client.get(
                 base_url,
                 params=params,
-                headers=working_headers,
+                headers=headers,
                 timeout=30,
             )
 
-            # 如果 status=ACTIVE 回 400，試不帶 status
-            if resp.status_code == 400:
-                params.pop("status", None)
-                resp = await client.get(
-                    base_url,
-                    params=params,
-                    headers=working_headers,
-                    timeout=30,
+            # 詳細記錄錯誤
+            if resp.status_code != 200:
+                body = resp.text[:300]
+                logger.error(
+                    f"predict.fun API 回傳 HTTP {resp.status_code} "
+                    f"(page={page}): {body}"
                 )
+                # 如果是 401/403，API key 有問題
+                if resp.status_code in (401, 403):
+                    logger.error("predict.fun: API Key 無效或已過期，請重新申請")
+                break
 
-            resp.raise_for_status()
             data = resp.json()
+
+            # 第一頁記錄回應結構
+            if page == 0:
+                if isinstance(data, dict):
+                    logger.info(f"predict.fun 回應 keys: {list(data.keys())}")
+                    logger.info(f"predict.fun success={data.get('success')}")
+                else:
+                    logger.info(f"predict.fun 回應類型: {type(data).__name__}")
+
+        except httpx.ConnectError as e:
+            logger.error(f"predict.fun 連線失敗: {e}")
+            break
+        except httpx.TimeoutException:
+            logger.error(f"predict.fun 請求逾時 (page={page})")
+            break
         except Exception as e:
-            logger.error(f"predict.fun API 錯誤 ({endpoint}, page={page}): {e}")
+            logger.error(f"predict.fun API 錯誤 (page={page}): {type(e).__name__}: {e}")
             break
 
-        # 解析回應：適配不同格式
-        items = _extract_predict_items(data)
+        # 解析回應
+        # 預期格式: { "success": true, "cursor": "...", "data": [...] }
+        items = []
+        if isinstance(data, dict):
+            items = data.get("data", [])
+            if not isinstance(items, list):
+                # 可能 data 包在其他 key 裡
+                for key in ["markets", "items", "results"]:
+                    if key in data and isinstance(data[key], list):
+                        items = data[key]
+                        break
+        elif isinstance(data, list):
+            items = data
 
         if not items:
             if page == 0:
-                logger.warning(f"predict.fun: {endpoint} 回傳空資料")
+                logger.warning(f"predict.fun: 首頁就沒資料 (data type={type(data).__name__})")
             break
 
+        # 第一頁記錄欄位結構
+        if page == 0 and items and isinstance(items[0], dict):
+            logger.info(f"predict.fun 市場欄位: {list(items[0].keys())}")
+
         for m in items:
-            market_id = str(
-                m.get("id")
-                or m.get("marketId")
-                or m.get("market_id")
-                or m.get("questionId")
-                or ""
-            )
+            if not isinstance(m, dict):
+                continue
+
+            market_id = str(m.get("id") or m.get("marketId") or "")
             if not market_id:
                 continue
 
-            title = (
-                m.get("title")
-                or m.get("question")
-                or m.get("name")
-                or m.get("description", "Unknown")
-            )
+            title = m.get("title") or m.get("question") or m.get("name") or "Unknown"
 
+            # predict.fun 可能沒有直接的 volume 欄位
+            # 根據文檔，市場欄位包含: id, title, question, status, categorySlug 等
+            # volume 可能需要從其他端點取得，先嘗試各種可能的欄位名
             volume_raw = (
                 m.get("volume")
                 or m.get("volumeUsd")
-                or m.get("total_volume")
                 or m.get("totalVolume")
+                or m.get("total_volume")
                 or m.get("volume24h")
                 or 0
             )
@@ -437,58 +391,33 @@ async def _try_predict_fun_endpoint(
             except (ValueError, TypeError):
                 volume = 0.0
 
-            # URL 建構
-            slug = m.get("slug") or m.get("market_slug") or ""
-            if slug:
-                url = f"https://predict.fun/{slug}"
+            # URL: 用 categorySlug + id 或直接用 id
+            cat_slug = m.get("categorySlug") or ""
+            if cat_slug:
+                url = f"https://predict.fun/{cat_slug}"
             else:
                 url = f"https://predict.fun/market/{market_id}"
 
             markets.append({
-                "id": f"pf_{market_id}",  # 加前綴避免與 polymarket id 衝突
+                "id": f"pf_{market_id}",
                 "question": title,
                 "volume": volume,
                 "url": url,
                 "source": "predict.fun",
             })
 
-        # 翻頁
+        # 翻頁：predict.fun 用 cursor 欄位
         next_cursor = None
         if isinstance(data, dict):
-            next_cursor = (
-                data.get("nextCursor")
-                or data.get("next_cursor")
-                or data.get("cursor")
-                or data.get("next")
-            )
+            next_cursor = data.get("cursor") or data.get("nextCursor") or data.get("next_cursor")
 
         page += 1
         if not next_cursor or len(items) < 100 or page >= 20:
             break
-        cursor = next_cursor
+        after_cursor = next_cursor
 
-    logger.info(f"predict.fun ({endpoint}): 取得 {len(markets)} 個市場")
+    logger.info(f"predict.fun: 取得 {len(markets)} 個市場")
     return markets
-
-
-def _extract_predict_items(data) -> list:
-    """從 predict.fun 回應中提取市場列表，適配各種格式"""
-    if isinstance(data, list):
-        return data
-
-    if isinstance(data, dict):
-        # 嘗試各種常見的 key
-        for key in ["markets", "data", "items", "results", "records", "events"]:
-            if key in data and isinstance(data[key], list):
-                return data[key]
-
-        # 如果有 pagination wrapper
-        if "pagination" in data or "meta" in data:
-            for key in data:
-                if isinstance(data[key], list):
-                    return data[key]
-
-    return []
 
 
 # ═══════════════════════════════════════════════════════════
