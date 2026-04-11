@@ -365,6 +365,12 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
         if page == 0 and items and isinstance(items[0], dict):
             logger.info(f"predict.fun 市場欄位: {list(items[0].keys())}")
 
+        # 第一頁額外記錄 stats 結構
+        if page == 0 and items and isinstance(items[0], dict):
+            stats_sample = items[0].get("stats")
+            if stats_sample:
+                logger.info(f"predict.fun stats 結構: {stats_sample}")
+
         for m in items:
             if not isinstance(m, dict):
                 continue
@@ -375,28 +381,41 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
 
             title = m.get("title") or m.get("question") or m.get("name") or "Unknown"
 
-            # predict.fun 可能沒有直接的 volume 欄位
-            # 根據文檔，市場欄位包含: id, title, question, status, categorySlug 等
-            # volume 可能需要從其他端點取得，先嘗試各種可能的欄位名
-            volume_raw = (
-                m.get("volume")
-                or m.get("volumeUsd")
-                or m.get("totalVolume")
-                or m.get("total_volume")
-                or m.get("volume24h")
-                or 0
-            )
-            try:
-                volume = float(volume_raw)
-            except (ValueError, TypeError):
-                volume = 0.0
+            # volume 從 stats 物件提取
+            # stats 格式: { volumeTotalUsd, volume24hUsd, totalLiquidityUsd }
+            stats = m.get("stats") or {}
+            volume = 0.0
+            if isinstance(stats, dict):
+                volume_raw = (
+                    stats.get("volumeTotalUsd")
+                    or stats.get("volume24hUsd")
+                    or stats.get("totalLiquidityUsd")
+                    or 0
+                )
+                try:
+                    volume = float(volume_raw)
+                except (ValueError, TypeError):
+                    volume = 0.0
 
-            # URL: 用 categorySlug + id 或直接用 id
+            # 如果 stats 裡沒有，嘗試頂層欄位
+            if volume == 0.0:
+                for key in ["volume", "volumeUsd", "totalVolume", "volume24h"]:
+                    raw = m.get(key)
+                    if raw:
+                        try:
+                            volume = float(raw)
+                            if volume > 0:
+                                break
+                        except (ValueError, TypeError):
+                            continue
+
+            # URL: predict.fun/{categorySlug} 是分類頁
+            # 單一市場可能是 predict.fun/{categorySlug}?market={id}
             cat_slug = m.get("categorySlug") or ""
             if cat_slug:
                 url = f"https://predict.fun/{cat_slug}"
             else:
-                url = f"https://predict.fun/market/{market_id}"
+                url = f"https://predict.fun/markets"
 
             markets.append({
                 "id": f"pf_{market_id}",
