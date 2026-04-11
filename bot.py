@@ -33,8 +33,8 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "")
-PREDICT_FUN_API_KEY = os.environ.get("PREDICT_FUN_API_KEY", "")
+TG_BOT_TOKEN = os.environ.get("TG_BOT_TOKEN", "").strip()
+PREDICT_FUN_API_KEY = os.environ.get("PREDICT_FUN_API_KEY", "").strip()
 
 if not TG_BOT_TOKEN:
     logger.error("❌ 未設定 TG_BOT_TOKEN 環境變數！")
