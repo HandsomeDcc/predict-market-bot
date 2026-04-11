@@ -333,7 +333,7 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
             logger.info(f"predict.fun 市場欄位: {list(items[0].keys())}")
             # 記錄 stats 和第一筆完整資料以便除錯
             logger.info(f"predict.fun stats={items[0].get('stats')}")
-            logger.info(f"predict.fun 第一筆 title={items[0].get('title')}, categorySlug={items[0].get('categorySlug')}")
+            logger.info(f"predict.fun 第一筆 title={items[0].get('title')}, question={items[0].get('question')}, categorySlug={items[0].get('categorySlug')}")
 
         for m in items:
             if not isinstance(m, dict):
@@ -343,7 +343,11 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
             if not market_id:
                 continue
 
-            title = m.get("title") or m.get("question") or "Unknown"
+            # question 通常是完整問題，title 可能只是簡短分類名
+            question_text = m.get("question") or ""
+            title_text = m.get("title") or ""
+            # 優先用 question（較完整），若沒有才用 title
+            title = question_text if len(question_text) > len(title_text) else (title_text or question_text or "Unknown")
 
             # stats 在列表 API 可能是 null，先從 stats 嘗試
             volume = 0.0
@@ -359,9 +363,12 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
                         except (ValueError, TypeError):
                             continue
 
-            # URL: predict.fun/{categorySlug} 是分類頁面
+            # URL: predict.fun 的盤口頁面格式為 /markets/{categorySlug}
             cat_slug = m.get("categorySlug") or ""
-            url = f"https://predict.fun/{cat_slug}" if cat_slug else "https://predict.fun/markets"
+            if cat_slug:
+                url = f"https://predict.fun/markets/{cat_slug}"
+            else:
+                url = "https://predict.fun/markets"
 
             markets.append({
                 "id": f"pf_{market_id}",
