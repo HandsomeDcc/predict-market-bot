@@ -286,6 +286,7 @@ async def _fetch_polymarket_markets_fallback(client: httpx.AsyncClient) -> list[
 # 市場欄位: id, title, question, status, categorySlug, outcomes, ...
 
 async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
+    """抓取 predict.fun 市場列表，再為相關盤口補充 volume"""
     if not PREDICT_FUN_API_KEY:
         logger.warning("未設定 PREDICT_FUN_API_KEY，跳過 predict.fun")
         return []
@@ -298,124 +299,69 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
 
     while True:
         try:
-            # predict.fun 用 first/after 分頁
             params: dict = {"first": 100}
             if after_cursor:
                 params["after"] = after_cursor
 
             resp = await client.get(
-                base_url,
-                params=params,
-                headers=headers,
-                timeout=30,
+                base_url, params=params, headers=headers, timeout=30,
             )
 
-            # 詳細記錄錯誤
             if resp.status_code != 200:
                 body = resp.text[:300]
-                logger.error(
-                    f"predict.fun API 回傳 HTTP {resp.status_code} "
-                    f"(page={page}): {body}"
-                )
-                # 如果是 401/403，API key 有問題
+                logger.error(f"predict.fun API HTTP {resp.status_code} (page={page}): {body}")
                 if resp.status_code in (401, 403):
-                    logger.error("predict.fun: API Key 無效或已過期，請重新申請")
+                    logger.error("predict.fun: API Key 無效或已過期")
                 break
 
             data = resp.json()
 
-            # 第一頁記錄回應結構
-            if page == 0:
-                if isinstance(data, dict):
-                    logger.info(f"predict.fun 回應 keys: {list(data.keys())}")
-                    logger.info(f"predict.fun success={data.get('success')}")
-                else:
-                    logger.info(f"predict.fun 回應類型: {type(data).__name__}")
+            if page == 0 and isinstance(data, dict):
+                logger.info(f"predict.fun 回應 keys: {list(data.keys())}")
+                logger.info(f"predict.fun success={data.get('success')}")
 
-        except httpx.ConnectError as e:
-            logger.error(f"predict.fun 連線失敗: {e}")
-            break
-        except httpx.TimeoutException:
-            logger.error(f"predict.fun 請求逾時 (page={page})")
-            break
         except Exception as e:
             logger.error(f"predict.fun API 錯誤 (page={page}): {type(e).__name__}: {e}")
             break
 
-        # 解析回應
-        # 預期格式: { "success": true, "cursor": "...", "data": [...] }
-        items = []
-        if isinstance(data, dict):
-            items = data.get("data", [])
-            if not isinstance(items, list):
-                # 可能 data 包在其他 key 裡
-                for key in ["markets", "items", "results"]:
-                    if key in data and isinstance(data[key], list):
-                        items = data[key]
-                        break
-        elif isinstance(data, list):
-            items = data
+        items = data.get("data", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
 
         if not items:
-            if page == 0:
-                logger.warning(f"predict.fun: 首頁就沒資料 (data type={type(data).__name__})")
             break
 
-        # 第一頁記錄欄位結構
-        if page == 0 and items and isinstance(items[0], dict):
+        if page == 0 and isinstance(items[0], dict):
             logger.info(f"predict.fun 市場欄位: {list(items[0].keys())}")
-
-        # 第一頁額外記錄 stats 結構
-        if page == 0 and items and isinstance(items[0], dict):
-            stats_sample = items[0].get("stats")
-            if stats_sample:
-                logger.info(f"predict.fun stats 結構: {stats_sample}")
+            # 記錄 stats 和第一筆完整資料以便除錯
+            logger.info(f"predict.fun stats={items[0].get('stats')}")
+            logger.info(f"predict.fun 第一筆 title={items[0].get('title')}, categorySlug={items[0].get('categorySlug')}")
 
         for m in items:
             if not isinstance(m, dict):
                 continue
 
-            market_id = str(m.get("id") or m.get("marketId") or "")
+            market_id = str(m.get("id") or "")
             if not market_id:
                 continue
 
-            title = m.get("title") or m.get("question") or m.get("name") or "Unknown"
+            title = m.get("title") or m.get("question") or "Unknown"
 
-            # volume 從 stats 物件提取
-            # stats 格式: { volumeTotalUsd, volume24hUsd, totalLiquidityUsd }
-            stats = m.get("stats") or {}
+            # stats 在列表 API 可能是 null，先從 stats 嘗試
             volume = 0.0
+            stats = m.get("stats")
             if isinstance(stats, dict):
-                volume_raw = (
-                    stats.get("volumeTotalUsd")
-                    or stats.get("volume24hUsd")
-                    or stats.get("totalLiquidityUsd")
-                    or 0
-                )
-                try:
-                    volume = float(volume_raw)
-                except (ValueError, TypeError):
-                    volume = 0.0
-
-            # 如果 stats 裡沒有，嘗試頂層欄位
-            if volume == 0.0:
-                for key in ["volume", "volumeUsd", "totalVolume", "volume24h"]:
-                    raw = m.get(key)
-                    if raw:
+                for vk in ["volumeTotalUsd", "volume24hUsd", "totalLiquidityUsd"]:
+                    v = stats.get(vk)
+                    if v is not None:
                         try:
-                            volume = float(raw)
+                            volume = float(v)
                             if volume > 0:
                                 break
                         except (ValueError, TypeError):
                             continue
 
-            # URL: predict.fun/{categorySlug} 是分類頁
-            # 單一市場可能是 predict.fun/{categorySlug}?market={id}
+            # URL: predict.fun/{categorySlug} 是分類頁面
             cat_slug = m.get("categorySlug") or ""
-            if cat_slug:
-                url = f"https://predict.fun/{cat_slug}"
-            else:
-                url = f"https://predict.fun/markets"
+            url = f"https://predict.fun/{cat_slug}" if cat_slug else "https://predict.fun/markets"
 
             markets.append({
                 "id": f"pf_{market_id}",
@@ -423,17 +369,77 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
                 "volume": volume,
                 "url": url,
                 "source": "predict.fun",
+                "_raw_id": market_id,  # 保留原始 ID 用於取 stats
+                "_cat_slug": cat_slug,
             })
 
-        # 翻頁：predict.fun 用 cursor 欄位
-        next_cursor = None
-        if isinstance(data, dict):
-            next_cursor = data.get("cursor") or data.get("nextCursor") or data.get("next_cursor")
-
+        next_cursor = data.get("cursor") if isinstance(data, dict) else None
         page += 1
         if not next_cursor or len(items) < 100 or page >= 20:
             break
         after_cursor = next_cursor
+
+    logger.info(f"predict.fun: 取得 {len(markets)} 個市場")
+
+    # ── 為需要 volume 的盤口補充 stats（呼叫 /v1/markets/{id}/stats）──
+    # 1. 主題相關盤口（一定要取 volume）
+    topic_markets = [m for m in markets if match_topics(m["question"])]
+    # 2. 取前 50 個盤口的 stats（用於交易量排名）
+    #    因為無法預知哪些 volume 最高，只能多取一些
+    non_topic_sample = [m for m in markets if m not in topic_markets][:50]
+    to_enrich = topic_markets + non_topic_sample
+    # 去重
+    seen_ids = set()
+    unique_enrich = []
+    for m in to_enrich:
+        if m["id"] not in seen_ids:
+            seen_ids.add(m["id"])
+            unique_enrich.append(m)
+
+    if unique_enrich:
+        logger.info(f"predict.fun: 為 {len(unique_enrich)} 個盤口取得 volume（主題={len(topic_markets)}, 抽樣={len(non_topic_sample)}）...")
+        await _enrich_predict_fun_stats(client, headers, unique_enrich)
+
+    return markets
+
+
+async def _enrich_predict_fun_stats(
+    client: httpx.AsyncClient,
+    headers: dict,
+    markets: list[dict],
+):
+    """批量呼叫 /v1/markets/{id}/stats 補充 volume 資料"""
+    sem = asyncio.Semaphore(10)  # 最多 10 個並發
+
+    async def fetch_stats(m: dict):
+        raw_id = m.get("_raw_id", "")
+        if not raw_id:
+            return
+        async with sem:
+            try:
+                resp = await client.get(
+                    f"{PREDICT_FUN_BASE}/v1/markets/{raw_id}/stats",
+                    headers=headers,
+                    timeout=15,
+                )
+                if resp.status_code == 200:
+                    data = resp.json()
+                    stats = data.get("data", {}) if isinstance(data, dict) else {}
+                    if isinstance(stats, dict):
+                        for vk in ["volumeTotalUsd", "volume24hUsd", "totalLiquidityUsd"]:
+                            v = stats.get(vk)
+                            if v is not None:
+                                try:
+                                    vol = float(v)
+                                    if vol > 0:
+                                        m["volume"] = vol
+                                        break
+                                except (ValueError, TypeError):
+                                    continue
+            except Exception as e:
+                logger.debug(f"predict.fun stats/{raw_id} 失敗: {e}")
+
+    await asyncio.gather(*(fetch_stats(m) for m in markets))
 
     logger.info(f"predict.fun: 取得 {len(markets)} 個市場")
     return markets
