@@ -411,7 +411,7 @@ async def _fetch_predict_fun_with_filter(
 
             # URL: 用 categorySlug 連結到 predict.fun
             cat_slug = m.get("categorySlug") or ""
-            url = f"https://predict.fun/{cat_slug}" if cat_slug else "https://predict.fun/markets"
+            url = f"https://predict.fun/market/{cat_slug}" if cat_slug else "https://predict.fun/markets"
 
             markets.append({
                 "id": f"pf_{market_id}",
