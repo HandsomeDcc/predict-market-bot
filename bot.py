@@ -291,18 +291,53 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
         logger.warning("未設定 PREDICT_FUN_API_KEY，跳過 predict.fun")
         return []
 
+    headers = {"x-api-key": PREDICT_FUN_API_KEY}
+
+    # ── 嘗試用 status 參數篩選活躍盤口 ──
+    # predict.fun API 可能支持 status 篩選，依序嘗試
+    for status_filter in ["ACTIVE", "TRADING", None]:
+        markets = await _fetch_predict_fun_with_filter(client, headers, status_filter)
+        if markets:
+            logger.info(f"predict.fun: status={status_filter} 取得 {len(markets)} 個市場 ✅")
+            break
+        else:
+            logger.info(f"predict.fun: status={status_filter} 取得 0 個市場，嘗試下一個...")
+    else:
+        # 所有 filter 都沒結果，抓全部（不過濾 status）
+        logger.info("predict.fun: 所有 status filter 無結果，抓取全部市場（不過濾）")
+        markets = await _fetch_predict_fun_with_filter(client, headers, None, skip_status_filter=True)
+
+    # ── 為所有盤口補充 volume（呼叫 /v1/markets/{id}/stats）──
+    need_enrich = [m for m in markets if m["volume"] == 0]
+    if need_enrich:
+        logger.info(f"predict.fun: 為 {len(need_enrich)} 個盤口取得 volume...")
+        await _enrich_predict_fun_stats(client, headers, need_enrich)
+        enriched_count = sum(1 for m in need_enrich if m["volume"] > 0)
+        logger.info(f"predict.fun: {enriched_count}/{len(need_enrich)} 個盤口成功取得 volume")
+
+    return markets
+
+
+async def _fetch_predict_fun_with_filter(
+    client: httpx.AsyncClient,
+    headers: dict,
+    status_filter: str | None,
+    skip_status_filter: bool = False,
+) -> list[dict]:
+    """用指定的 status filter 抓取 predict.fun 市場"""
     markets = []
     after_cursor = None
     page = 0
-    skipped = 0
+    status_counts: dict[str, int] = {}  # 統計各 status 數量
     base_url = f"{PREDICT_FUN_BASE}/v1/markets"
-    headers = {"x-api-key": PREDICT_FUN_API_KEY}
 
     while True:
         try:
             params: dict = {"first": 100}
             if after_cursor:
                 params["after"] = after_cursor
+            if status_filter:
+                params["status"] = status_filter
 
             resp = await client.get(
                 base_url, params=params, headers=headers, timeout=30,
@@ -311,15 +346,12 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
             if resp.status_code != 200:
                 body = resp.text[:300]
                 logger.error(f"predict.fun API HTTP {resp.status_code} (page={page}): {body}")
-                if resp.status_code in (401, 403):
-                    logger.error("predict.fun: API Key 無效或已過期")
                 break
 
             data = resp.json()
 
             if page == 0 and isinstance(data, dict):
-                logger.info(f"predict.fun 回應 keys: {list(data.keys())}")
-                logger.info(f"predict.fun success={data.get('success')}")
+                logger.info(f"predict.fun 回應 keys={list(data.keys())}, success={data.get('success')}")
 
         except Exception as e:
             logger.error(f"predict.fun API 錯誤 (page={page}): {type(e).__name__}: {e}")
@@ -331,13 +363,12 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
             break
 
         if page == 0 and isinstance(items[0], dict):
-            logger.info(f"predict.fun 市場欄位: {list(items[0].keys())}")
-            # 記錄 stats 和第一筆完整資料以便除錯
-            logger.info(f"predict.fun stats={items[0].get('stats')}")
             first = items[0]
-            logger.info(f"predict.fun 第一筆 title={first.get('title')}, question={first.get('question')}")
-            logger.info(f"predict.fun 第一筆 status={first.get('status')}, tradingStatus={first.get('tradingStatus')}")
-            logger.info(f"predict.fun 第一筆 slug={first.get('slug')}, categorySlug={first.get('categorySlug')}, id={first.get('id')}")
+            logger.info(f"predict.fun 欄位: {list(first.keys())}")
+            logger.info(f"predict.fun 第一筆: title={first.get('title')}")
+            logger.info(f"predict.fun 第一筆: question={first.get('question')}")
+            logger.info(f"predict.fun 第一筆: status={first.get('status')}, tradingStatus={first.get('tradingStatus')}")
+            logger.info(f"predict.fun 第一筆: categorySlug={first.get('categorySlug')}, id={first.get('id')}")
 
         for m in items:
             if not isinstance(m, dict):
@@ -347,24 +378,24 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
             if not market_id:
                 continue
 
-            # ── 過濾掉已結束/已取消的盤口 ──
-            status = (m.get("status") or "").lower()
-            trading_status = (m.get("tradingStatus") or "").lower()
-            # 只保留活躍的盤口（排除 resolved, closed, cancelled 等）
-            if status in ("resolved", "closed", "cancelled", "canceled", "paused"):
-                skipped += 1
-                continue
-            if trading_status in ("closed", "halted", "resolved"):
-                skipped += 1
-                continue
+            status = (m.get("status") or "").upper()
+            trading_status = (m.get("tradingStatus") or "").upper()
+            status_key = f"{status}/{trading_status}"
+            status_counts[status_key] = status_counts.get(status_key, 0) + 1
+
+            # ── 過濾已結束的盤口（除非 skip_status_filter=True）──
+            if not skip_status_filter:
+                if status in ("RESOLVED", "CANCELLED", "CANCELED"):
+                    continue
+                if trading_status in ("CLOSED", "HALTED"):
+                    continue
 
             # question 通常是完整問題，title 可能只是簡短分類名
             question_text = m.get("question") or ""
             title_text = m.get("title") or ""
-            # 優先用 question（較完整），若沒有才用 title
             title = question_text if len(question_text) > len(title_text) else (title_text or question_text or "Unknown")
 
-            # stats 在列表 API 可能是 null，先從 stats 嘗試
+            # stats 在列表 API 可能是 null，先嘗試
             volume = 0.0
             stats_data = m.get("stats")
             if isinstance(stats_data, dict):
@@ -378,18 +409,9 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
                         except (ValueError, TypeError):
                             continue
 
-            # URL: 連結到 predict.fun 盤口頁面
-            # predict.fun 是 SPA，嘗試 /{categorySlug} 格式
+            # URL: 用 categorySlug 連結到 predict.fun
             cat_slug = m.get("categorySlug") or ""
-            market_slug = m.get("slug") or ""
-            if market_slug:
-                # 如果有 market slug，用它
-                url = f"https://predict.fun/{market_slug}"
-            elif cat_slug:
-                # 否則用 category slug
-                url = f"https://predict.fun/{cat_slug}"
-            else:
-                url = "https://predict.fun/markets"
+            url = f"https://predict.fun/{cat_slug}" if cat_slug else "https://predict.fun/markets"
 
             markets.append({
                 "id": f"pf_{market_id}",
@@ -399,7 +421,6 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
                 "source": "predict.fun",
                 "_raw_id": market_id,
                 "_cat_slug": cat_slug,
-                "_status": status,
             })
 
         next_cursor = data.get("cursor") if isinstance(data, dict) else None
@@ -408,17 +429,9 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
             break
         after_cursor = next_cursor
 
-    logger.info(f"predict.fun: 取得 {len(markets)} 個活躍市場（跳過 {skipped} 個已結束）")
-
-    # ── 為所有盤口補充 volume（呼叫 /v1/markets/{id}/stats）──
-    # list API 的 stats 欄位一律是 null，必須逐一取
-    need_enrich = [m for m in markets if m["volume"] == 0]
-    if need_enrich:
-        logger.info(f"predict.fun: 為 {len(need_enrich)} 個盤口取得 volume...")
-        await _enrich_predict_fun_stats(client, headers, need_enrich)
-        enriched_count = sum(1 for m in need_enrich if m["volume"] > 0)
-        logger.info(f"predict.fun: {enriched_count}/{len(need_enrich)} 個盤口成功取得 volume")
-
+    # 印出 status 統計
+    logger.info(f"predict.fun status 統計: {status_counts}")
+    logger.info(f"predict.fun: filter={status_filter}, 取得 {len(markets)} 個市場")
     return markets
 
 
