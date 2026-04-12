@@ -294,6 +294,7 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
     markets = []
     after_cursor = None
     page = 0
+    skipped = 0
     base_url = f"{PREDICT_FUN_BASE}/v1/markets"
     headers = {"x-api-key": PREDICT_FUN_API_KEY}
 
@@ -333,7 +334,10 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
             logger.info(f"predict.fun 市場欄位: {list(items[0].keys())}")
             # 記錄 stats 和第一筆完整資料以便除錯
             logger.info(f"predict.fun stats={items[0].get('stats')}")
-            logger.info(f"predict.fun 第一筆 title={items[0].get('title')}, question={items[0].get('question')}, categorySlug={items[0].get('categorySlug')}")
+            first = items[0]
+            logger.info(f"predict.fun 第一筆 title={first.get('title')}, question={first.get('question')}")
+            logger.info(f"predict.fun 第一筆 status={first.get('status')}, tradingStatus={first.get('tradingStatus')}")
+            logger.info(f"predict.fun 第一筆 slug={first.get('slug')}, categorySlug={first.get('categorySlug')}, id={first.get('id')}")
 
         for m in items:
             if not isinstance(m, dict):
@@ -341,6 +345,17 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
 
             market_id = str(m.get("id") or "")
             if not market_id:
+                continue
+
+            # ── 過濾掉已結束/已取消的盤口 ──
+            status = (m.get("status") or "").lower()
+            trading_status = (m.get("tradingStatus") or "").lower()
+            # 只保留活躍的盤口（排除 resolved, closed, cancelled 等）
+            if status in ("resolved", "closed", "cancelled", "canceled", "paused"):
+                skipped += 1
+                continue
+            if trading_status in ("closed", "halted", "resolved"):
+                skipped += 1
                 continue
 
             # question 通常是完整問題，title 可能只是簡短分類名
@@ -351,10 +366,10 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
 
             # stats 在列表 API 可能是 null，先從 stats 嘗試
             volume = 0.0
-            stats = m.get("stats")
-            if isinstance(stats, dict):
+            stats_data = m.get("stats")
+            if isinstance(stats_data, dict):
                 for vk in ["volumeTotalUsd", "volume24hUsd", "totalLiquidityUsd"]:
-                    v = stats.get(vk)
+                    v = stats_data.get(vk)
                     if v is not None:
                         try:
                             volume = float(v)
@@ -363,10 +378,16 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
                         except (ValueError, TypeError):
                             continue
 
-            # URL: predict.fun 的盤口頁面格式為 /markets/{categorySlug}
+            # URL: 連結到 predict.fun 盤口頁面
+            # predict.fun 是 SPA，嘗試 /{categorySlug} 格式
             cat_slug = m.get("categorySlug") or ""
-            if cat_slug:
-                url = f"https://predict.fun/markets/{cat_slug}"
+            market_slug = m.get("slug") or ""
+            if market_slug:
+                # 如果有 market slug，用它
+                url = f"https://predict.fun/{market_slug}"
+            elif cat_slug:
+                # 否則用 category slug
+                url = f"https://predict.fun/{cat_slug}"
             else:
                 url = "https://predict.fun/markets"
 
@@ -376,8 +397,9 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
                 "volume": volume,
                 "url": url,
                 "source": "predict.fun",
-                "_raw_id": market_id,  # 保留原始 ID 用於取 stats
+                "_raw_id": market_id,
                 "_cat_slug": cat_slug,
+                "_status": status,
             })
 
         next_cursor = data.get("cursor") if isinstance(data, dict) else None
@@ -386,26 +408,16 @@ async def fetch_predict_fun_markets(client: httpx.AsyncClient) -> list[dict]:
             break
         after_cursor = next_cursor
 
-    logger.info(f"predict.fun: 取得 {len(markets)} 個市場")
+    logger.info(f"predict.fun: 取得 {len(markets)} 個活躍市場（跳過 {skipped} 個已結束）")
 
-    # ── 為需要 volume 的盤口補充 stats（呼叫 /v1/markets/{id}/stats）──
-    # 1. 主題相關盤口（一定要取 volume）
-    topic_markets = [m for m in markets if match_topics(m["question"])]
-    # 2. 取前 50 個盤口的 stats（用於交易量排名）
-    #    因為無法預知哪些 volume 最高，只能多取一些
-    non_topic_sample = [m for m in markets if m not in topic_markets][:50]
-    to_enrich = topic_markets + non_topic_sample
-    # 去重
-    seen_ids = set()
-    unique_enrich = []
-    for m in to_enrich:
-        if m["id"] not in seen_ids:
-            seen_ids.add(m["id"])
-            unique_enrich.append(m)
-
-    if unique_enrich:
-        logger.info(f"predict.fun: 為 {len(unique_enrich)} 個盤口取得 volume（主題={len(topic_markets)}, 抽樣={len(non_topic_sample)}）...")
-        await _enrich_predict_fun_stats(client, headers, unique_enrich)
+    # ── 為所有盤口補充 volume（呼叫 /v1/markets/{id}/stats）──
+    # list API 的 stats 欄位一律是 null，必須逐一取
+    need_enrich = [m for m in markets if m["volume"] == 0]
+    if need_enrich:
+        logger.info(f"predict.fun: 為 {len(need_enrich)} 個盤口取得 volume...")
+        await _enrich_predict_fun_stats(client, headers, need_enrich)
+        enriched_count = sum(1 for m in need_enrich if m["volume"] > 0)
+        logger.info(f"predict.fun: {enriched_count}/{len(need_enrich)} 個盤口成功取得 volume")
 
     return markets
 
@@ -416,9 +428,11 @@ async def _enrich_predict_fun_stats(
     markets: list[dict],
 ):
     """批量呼叫 /v1/markets/{id}/stats 補充 volume 資料"""
-    sem = asyncio.Semaphore(10)  # 最多 10 個並發
+    sem = asyncio.Semaphore(25)  # 最多 25 個並發
+    first_stats_logged = False
 
     async def fetch_stats(m: dict):
+        nonlocal first_stats_logged
         raw_id = m.get("_raw_id", "")
         if not raw_id:
             return
@@ -427,10 +441,14 @@ async def _enrich_predict_fun_stats(
                 resp = await client.get(
                     f"{PREDICT_FUN_BASE}/v1/markets/{raw_id}/stats",
                     headers=headers,
-                    timeout=15,
+                    timeout=10,
                 )
                 if resp.status_code == 200:
                     data = resp.json()
+                    # 記錄第一筆 stats 回應以便除錯
+                    if not first_stats_logged:
+                        first_stats_logged = True
+                        logger.info(f"predict.fun stats 回應範例: {data}")
                     stats = data.get("data", {}) if isinstance(data, dict) else {}
                     if isinstance(stats, dict):
                         for vk in ["volumeTotalUsd", "volume24hUsd", "totalLiquidityUsd"]:
@@ -443,13 +461,14 @@ async def _enrich_predict_fun_stats(
                                         break
                                 except (ValueError, TypeError):
                                     continue
+                elif resp.status_code == 429:
+                    # rate limited，等一下再試
+                    logger.warning(f"predict.fun stats rate limited, waiting...")
+                    await asyncio.sleep(2)
             except Exception as e:
                 logger.debug(f"predict.fun stats/{raw_id} 失敗: {e}")
 
     await asyncio.gather(*(fetch_stats(m) for m in markets))
-
-    logger.info(f"predict.fun: 取得 {len(markets)} 個市場")
-    return markets
 
 
 # ═══════════════════════════════════════════════════════════
